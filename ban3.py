@@ -17,13 +17,13 @@ from requests.exceptions import ReadTimeout
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # Telegram bot token and channel IDs
-TOKEN = '7788865701:AAHg0Ii5mPeIJcReFzGgSg_4qFaN8pF9ArQ'  # Replace with your actual bot token
-CHANNEL_ID = '-1002287609881'  # Replace with your specific channel or group ID for attacks
-FEEDBACK_CHANNEL_ID = '-1002294913266'  # Replace with your specific channel ID for feedback
+TOKEN = '7828525928:AAGZIUO4QnLsD_ITKGSkfN5NlGP3UZvU1OM'  # Replace with your actual bot token
+CHANNEL_ID = '-1002298552334'  # Replace with your specific channel or group ID for attacks
+FEEDBACK_CHANNEL_ID = '-1002124760113'  # Replace with your specific channel ID for feedback
 message_queue = []
 # Predefined values for packet size and thread count
-PREDEFINED_PACKET_SIZE = 8  # Example: 1024 bytes
-PREDEFINED_THREAD_COUNT = 900  # Example: 500 threads
+PREDEFINED_PACKET_SIZE = 12  # Example: 1024 bytes
+PREDEFINED_THREAD_COUNT = 500  # Example: 500 threads
 
 # Official channel details
 OFFICIAL_CHANNEL = "@titanddos24op"  # Replace with your channel username or ID
@@ -49,7 +49,7 @@ pending_feedback = set()
 reset_time = datetime.now().astimezone(timezone(timedelta(hours=5, minutes=30))).replace(hour=0, minute=0, second=0, microsecond=0)
 
 # Configuration
-COOLDOWN_DURATION = 60  # 1 minute cooldown
+COOLDOWN_DURATION = 120  # 1 minute cooldown
 BAN_DURATION = timedelta(hours=1)  # 1 hour ban for invalid feedback
 DAILY_ATTACK_LIMIT = 5000
 EXEMPTED_USERS = [7163028849, 7184121244]
